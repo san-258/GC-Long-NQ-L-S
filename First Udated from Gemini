@@ -1,0 +1,181 @@
+import asyncio
+import sys
+import logging
+import pandas as pd
+from ib_insync import *
+
+# -----------------------------------------------------------------------------
+# CONFIGURATION
+# -----------------------------------------------------------------------------
+IB_PORT = 4001 # Gateway
+CLIENT_ID = 999
+
+# FIXED: Correct Micro Symbols
+CONTRACTS = {
+    'GC': {'symbol': 'MGC', 'exchange': 'COMEX', 'currency': 'USD', 'expiry': '202602'}, # Micro Gold
+    'NQ': {'symbol': 'MNQ', 'exchange': 'CME',   'currency': 'USD', 'expiry': '202603'}  # Micro Nasdaq
+}
+
+# ... [Keep your STRATEGIES list exactly as it is] ...
+# ... [Keep TF_MAP and LOGGING as is] ...
+
+class AutoBot:
+    def __init__(self):
+        self.ib = IB()
+        self.contracts = {}
+        self.bars = {}
+        self.dfs = {}
+        self.pending_orders = {} 
+        self.positions = {}      
+        self.initialized = False
+
+    async def connect(self):
+        try:
+            print(f"Connecting to IB on port {IB_PORT}...")
+            await self.ib.connectAsync('127.0.0.1', IB_PORT, clientId=CLIENT_ID)
+            print("Connected.")
+            # ERROR HANDLER: Catch rejections
+            self.ib.errorEvent += self.on_error
+            # STATUS HANDLER: Catch order states
+            self.ib.orderStatusEvent += self.on_order_status
+        except Exception as e:
+            print(f"Connection Failed: {e}")
+            sys.exit(1)
+
+    async def setup_contracts(self):
+        print("Qualifying Contracts...")
+        for sym, details in CONTRACTS.items():
+            # NOTE: For Futures, always include 'multiplier' if trading something exotic, 
+            # but for MNQ/MGC, symbol + exchange is usually enough.
+            c = Future(symbol=details['symbol'], 
+                       lastTradeDateOrContractMonth=details['expiry'], 
+                       exchange=details['exchange'], 
+                       currency=details['currency'])
+            
+            # Critical: Ensure we get the right contract
+            qual = await self.ib.qualifyContractsAsync(c)
+            if not qual:
+                print(f"CRITICAL: Could not qualify {sym}")
+                sys.exit(1)
+            
+            self.contracts[sym] = c
+            print(f"Qualified {sym}: {c.localSymbol} (Mult: {c.multiplier})")
+
+    # FIXED: Hydrate positions from IBKR on startup
+    async def hydrate_positions(self):
+        print("Syncing Open Positions...")
+        current_positions = self.ib.positions()
+        
+        # This is a naive sync: It assumes if we have MGC, it belongs to GC_LONG.
+        # In reality, you need to check the 'orderRef' of the trade that opened it.
+        # Since IBKR positions don't store 'orderRef', we just check if we have ANY size.
+        
+        for p in current_positions:
+            contract = p.contract
+            await self.ib.qualifyContractsAsync(contract)
+            
+            # Map IBKR contract back to our internal Strategy ID
+            # This logic assumes 1 strategy per symbol for simplicity in sync
+            if contract.symbol == 'MGC' and p.position > 0:
+                self.positions['GC_LONG'] = True
+                print(f"Restored State: GC_LONG is ACTIVE (Size: {p.position})")
+            elif contract.symbol == 'MNQ' and p.position > 0:
+                self.positions['NQ_LONG'] = True
+                print(f"Restored State: NQ_LONG is ACTIVE")
+            elif contract.symbol == 'MNQ' and p.position < 0:
+                self.positions['NQ_SHORT'] = True
+                print(f"Restored State: NQ_SHORT is ACTIVE")
+
+    async def start_data_streams(self):
+        # [Same as your original code]
+        pass 
+
+    # -------------------------------------------------------------------------
+    # FIXED: Event Handlers for Safety
+    # -------------------------------------------------------------------------
+    def on_error(self, reqId, errorCode, errorString, contract):
+        # Code 201: Order rejected
+        # Code 202: Order cancelled
+        if errorCode in [201, 202]:
+            print(f"ORDER REJECTED/CANCELLED: {errorString}")
+            
+            # We must clear the 'pending' flag so the bot can try again LATER
+            # (or stop it from thinking it has a pending order forever)
+            # We don't know the Strat ID easily here without parsing, 
+            # so we rely on on_order_status
+            pass
+
+    def on_order_status(self, trade):
+        status = trade.orderStatus.status
+        strat_id = trade.order.orderRef
+        
+        # If order is dead, clear pending state
+        if status in ['Cancelled', 'Inactive', 'Rejected']:
+            if strat_id in self.pending_orders:
+                print(f"Order {status} for {strat_id}. Clearing pending state.")
+                del self.pending_orders[strat_id]
+                
+            # SAFETY: If we tried to exit and failed, we are technically still in position
+            # We do NOT delete self.positions[strat_id] here.
+            
+    def on_exec_details(self, trade, fill):
+        strat_id = trade.order.orderRef
+        if not strat_id: return
+        
+        print(f"FILL: {strat_id} {fill.execution.side} {fill.execution.shares} @ {fill.execution.price}")
+        
+        if trade.order.orderType == 'STP': # Entry
+            if strat_id in self.pending_orders:
+                del self.pending_orders[strat_id]
+            self.positions[strat_id] = True
+            
+        elif trade.order.orderType == 'MKT': # Exit
+            # ONLY remove position when we confirm the fill
+            if strat_id in self.positions:
+                del self.positions[strat_id]
+
+    # -------------------------------------------------------------------------
+    # Logic methods (update_df, check_strategies) remain largely the same,
+    # BUT remove the "del self.positions" from check_strategies
+    # -------------------------------------------------------------------------
+
+    def run_strategy_logic(self, strat):
+        # [Keep your logic until the Exit part]
+        # ...
+        
+        # --- FIXED EXIT LOGIC ---
+        if is_in_trade:
+            # ... (calc should_exit) ...
+            if should_exit:
+                print(f"EXIT SIGNAL triggered for {strat_id}")
+                action = 'SELL' if side == 'LONG' else 'BUY'
+                
+                # Check if we already have an active exit order to avoid spamming
+                open_orders = [o for o in self.ib.openOrders() if o.orderRef == strat_id]
+                if not open_orders:
+                    self.place_market_order(contract, action, 1, strat_id)
+                
+                # CRITICAL: DO NOT DELETE POSITION HERE. 
+                # Let on_exec_details delete it when filled.
+                return
+        
+        # ... [Rest of Entry Logic] ...
+
+    def run(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self.connect())
+        loop.run_until_complete(self.setup_contracts())
+        loop.run_until_complete(self.hydrate_positions()) # <--- Added this
+        loop.run_until_complete(self.start_data_streams())
+        
+        self.ib.execDetailsEvent += self.on_exec_details
+        
+        print("Bot is running...")
+        try:
+            self.ib.run()
+        except KeyboardInterrupt:
+            self.ib.disconnect()
+
+if __name__ == '__main__':
+    bot = AutoBot()
+    bot.run()
