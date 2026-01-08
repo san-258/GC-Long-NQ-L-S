@@ -1,0 +1,608 @@
+import pandas as pd
+from datetime import datetime
+import json
+
+class StrategyBrain:
+    def __init__(self):
+        print("🧠 BRAIN LOADED: Sandip's Original Strategy + Smart Position Management")
+        
+        # ==================== STRATEGY CONFIGURATION ====================
+        # Based on 1,301 trades backtested across 2025
+        # Annual expectation: $268,704 with time filter
+        
+        self.strategies = {
+            # GC "Lazy Hunter" - Loose EMA20 leash for big Gold moves
+            'GC_LONG': {
+                'ema_entry': 10,   # 5M entry EMA
+                'ema_exit': 20,    # 15M exit EMA (LOOSE LEASH!)
+                'side': 'LONG',
+                'instrument': 'GC'
+            },
+            
+            # NQ "Momentum Surfer" - Tight EMA10 leash for fast tech moves
+            'NQ_LONG': {
+                'ema_entry': 10,   # 5M entry EMA
+                'ema_exit': 10,    # 15M exit EMA (TIGHT LEASH)
+                'side': 'LONG',
+                'instrument': 'NQ'
+            },
+            
+            # NQ "Widowmaker" - Very tight 5M exit to avoid squeezes
+            'NQ_SHORT': {
+                'ema_entry': 10,   # 5M entry EMA
+                'ema_exit': 10,    # 5M exit EMA (VERY TIGHT!)
+                'side': 'SHORT',
+                'instrument': 'NQ'
+            }
+        }
+        
+        # ==================== SMART POSITION MANAGEMENT ====================
+        # Rules:
+        # 1. Maximum 2 positions: 1 GC + 1 NQ
+        # 2. NQ_LONG and NQ_SHORT are mutually exclusive
+        # 3. GC can trade independently
+        
+        print("   🧠 Smart Position Rules:")
+        print("      ✓ Max 2 positions: 1 GC + 1 NQ")
+        print("      ✓ NQ_LONG blocks NQ_SHORT (and vice versa)")
+        print("      ✓ No contradictory positions")
+        
+        # ==================== TIME WINDOW FILTER ====================
+        # Universal bad hours - terrible for ALL strategies
+        # Based on hour-of-day analysis of 1,301 trades
+        self.BAD_HOURS = [9, 11, 13, 15, 21]
+        
+        # Hour 9:  Morning open chop (23% WR)
+        # Hour 11: Worst hour (18% WR) 
+        # Hour 13: Lunch doldrums (-$8,630)
+        # Hour 15: Afternoon fade (-$3,340)
+        # Hour 21: Evening disaster (-$22,770)
+        
+        # ==================== DISASTER STOPS ====================
+        # Based on backtest: worst day was -$8,735
+        # Set at ~2.3x worst day for disaster-only protection
+        self.DAILY_LOSS_LIMIT = 20000   # Only stops at catastrophic failure
+        self.WEEKLY_LOSS_LIMIT = 20000  # Only stops at catastrophic failure
+        
+        # Track P&L for stop limits
+        self.daily_pnl = 0
+        self.weekly_pnl = 0
+        self.last_reset_date = datetime.now().date()
+        self.last_reset_week = datetime.now().isocalendar()[1]
+        
+        # ==================== STATE TRACKING ====================
+        # CRITICAL: Track cross detection and first candle only
+        self.state = {}
+        for strat_id in self.strategies.keys():
+            self.state[strat_id] = {
+                'cross_detected': False,
+                'waiting_for_candle': False,
+                'in_position': False
+            }
+        
+        # ==================== COMPREHENSIVE LOGGING ====================
+        # Track everything for red flag detection
+        self.session_log = {
+            'session_start': datetime.now(),
+            'trades': [],
+            'signals': [],
+            'blocks': [],
+            'bad_hour_trades': [],  # RED FLAG tracker
+            'bad_hour_exits': [],   # Should be OK
+            'position_conflicts': [],  # RED FLAG tracker
+            'errors': [],
+            'heartbeat_errors': [],
+            'daily_summary': {}
+        }
+        
+        # Track position conflicts blocked (for logging)
+        self.conflicts_blocked = 0
+        
+        print(f"   ⏰ Time Filter: Avoid ENTRIES during hours {self.BAD_HOURS}")
+        print(f"   ⚠️  EXITS work 24/7 - always monitored!")
+        print(f"   🛑 Daily Stop: ${self.DAILY_LOSS_LIMIT:,}")
+        print(f"   🛑 Weekly Stop: ${self.WEEKLY_LOSS_LIMIT:,}")
+        print(f"   📊 Expected Annual: $268,704")
+        print(f"   🎯 Expected Win Rate: 42.1%")
+        print(f"   📝 Comprehensive logging: ENABLED")
+        
+        self._log_event("STARTUP", "Bot initialized successfully")
+
+    def _log_event(self, event_type, message, data=None):
+        """
+        Comprehensive logging for all events
+        Makes it easy to track red flags in bot_log.txt
+        """
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        hour = datetime.now().hour
+        
+        log_entry = {
+            'timestamp': timestamp,
+            'hour': hour,
+            'type': event_type,
+            'message': message
+        }
+        
+        if data:
+            log_entry['data'] = data
+        
+        # Print to console (goes to bot_log.txt)
+        if event_type == "RED_FLAG":
+            print(f"\n{'='*80}")
+            print(f"🚨 RED FLAG DETECTED: {message}")
+            print(f"   Time: {timestamp} (Hour {hour})")
+            if data:
+                print(f"   Details: {json.dumps(data, indent=2)}")
+            print(f"{'='*80}\n")
+        elif event_type == "WARNING":
+            print(f"⚠️  [{timestamp}] WARNING: {message}")
+        elif event_type == "INFO":
+            print(f"ℹ️  [{timestamp}] {message}")
+        
+        # Store in session log
+        if event_type == "RED_FLAG":
+            self.session_log['errors'].append(log_entry)
+        elif event_type == "SIGNAL":
+            self.session_log['signals'].append(log_entry)
+        elif event_type == "TRADE":
+            self.session_log['trades'].append(log_entry)
+
+    def should_enter_new_position(self):
+        """
+        CRITICAL: Separate function for ENTRY time filtering
+        Exits are ALWAYS checked regardless of time!
+        
+        Returns: (bool, str) - (can_enter, reason)
+        """
+        current_hour = datetime.now().hour
+        
+        # Check time window filter FOR ENTRIES ONLY
+        if current_hour in self.BAD_HOURS:
+            return False, f"Bad hour ({current_hour}:00)"
+        
+        # Check daily/weekly resets
+        self._check_resets()
+        
+        # Check daily stop
+        if self.daily_pnl <= -self.DAILY_LOSS_LIMIT:
+            self._log_event("WARNING", f"Daily loss limit hit: ${self.daily_pnl:,.0f}")
+            return False, f"Daily loss limit hit: ${self.daily_pnl:,.0f}"
+        
+        # Check weekly stop
+        if self.weekly_pnl <= -self.WEEKLY_LOSS_LIMIT:
+            self._log_event("WARNING", f"Weekly loss limit hit: ${self.weekly_pnl:,.0f}")
+            return False, f"Weekly loss limit hit: ${self.weekly_pnl:,.0f}"
+        
+        return True, "OK"
+    
+    def should_trade_now(self):
+        """
+        BACKWARD COMPATIBILITY: Alias for should_enter_new_position()
+        Used by main_bot.py heartbeat to check trading status
+        """
+        return self.should_enter_new_position()
+
+    def _check_resets(self):
+        """Reset daily/weekly counters if needed"""
+        today = datetime.now().date()
+        current_week = datetime.now().isocalendar()[1]
+        
+        # Reset daily
+        if today > self.last_reset_date:
+            summary = self._generate_daily_summary()
+            print(f"\n{'='*80}")
+            print(f"📅 DAILY RESET - {self.last_reset_date}")
+            print(f"{'='*80}")
+            print(f"Previous Day P&L: ${self.daily_pnl:,.0f}")
+            print(f"Trades: {summary['trades']}")
+            print(f"Signals: {summary['signals']}")
+            print(f"Blocks: {summary['blocks']}")
+            print(f"Red Flags: {summary['red_flags']}")
+            print(f"{'='*80}\n")
+            
+            self._log_event("INFO", f"Daily reset: Previous P&L ${self.daily_pnl:,.0f}, {summary['trades']} trades")
+            
+            self.daily_pnl = 0
+            self.last_reset_date = today
+            
+            # Reset daily counters
+            self.session_log['trades'] = []
+            self.session_log['signals'] = []
+            self.session_log['blocks'] = []
+            self.session_log['bad_hour_trades'] = []
+            self.session_log['bad_hour_exits'] = []
+        
+        # Reset weekly
+        if current_week != self.last_reset_week:
+            print(f"📅 Weekly reset: Previous week P&L was ${self.weekly_pnl:,.0f}")
+            self._log_event("INFO", f"Weekly reset: Previous P&L ${self.weekly_pnl:,.0f}")
+            self.weekly_pnl = 0
+            self.last_reset_week = current_week
+
+    def _generate_daily_summary(self):
+        """Generate summary of daily activity"""
+        return {
+            'trades': len(self.session_log['trades']),
+            'signals': len(self.session_log['signals']),
+            'blocks': len(self.session_log['blocks']),
+            'red_flags': len(self.session_log['errors']),
+            'bad_hour_trades': len(self.session_log['bad_hour_trades']),
+            'conflicts': len(self.session_log['position_conflicts'])
+        }
+
+    def record_trade_result(self, strat_id, pnl):
+        """
+        Record trade P&L for stop tracking
+        Call this after each trade closes
+        """
+        self.daily_pnl += pnl
+        self.weekly_pnl += pnl
+        
+        print(f"💰 {strat_id} P&L: ${pnl:,.0f} | Daily: ${self.daily_pnl:,.0f} | Weekly: ${self.weekly_pnl:,.0f}")
+        
+        self._log_event("TRADE", f"{strat_id} closed: P&L ${pnl:,.0f}", {
+            'strategy': strat_id,
+            'pnl': pnl,
+            'daily_pnl': self.daily_pnl,
+            'weekly_pnl': self.weekly_pnl
+        })
+        
+        # Check for P&L tracking issues (RED FLAG)
+        if pnl == 0:
+            self._log_event("WARNING", f"Zero P&L recorded for {strat_id} - verify tracking")
+
+    def _check_position_conflict(self, strat_id):
+        """
+        SMART POSITION MANAGEMENT
+        Check if we can open this position or if it conflicts with existing positions
+        
+        Rules:
+        1. NQ_LONG cannot open if NQ_SHORT is in position
+        2. NQ_SHORT cannot open if NQ_LONG is in position
+        3. GC_LONG can always open (different instrument)
+        
+        Returns: (can_open, reason)
+        """
+        config = self.strategies[strat_id]
+        instrument = config['instrument']
+        side = config['side']
+        
+        # GC can always trade (no conflicts)
+        if instrument == 'GC':
+            return True, "OK"
+        
+        # NQ - check for opposite direction
+        if instrument == 'NQ':
+            if side == 'LONG':
+                # Check if NQ_SHORT is in position
+                if self.state.get('NQ_SHORT', {}).get('in_position', False):
+                    self.conflicts_blocked += 1
+                    
+                    # Log the block
+                    self._log_event("INFO", f"Position conflict blocked: {strat_id} (NQ_SHORT in position)")
+                    self.session_log['blocks'].append({
+                        'timestamp': datetime.now(),
+                        'blocked': strat_id,
+                        'reason': 'NQ_SHORT already in position'
+                    })
+                    
+                    return False, "NQ_SHORT already in position"
+            else:  # SHORT
+                # Check if NQ_LONG is in position
+                if self.state.get('NQ_LONG', {}).get('in_position', False):
+                    self.conflicts_blocked += 1
+                    
+                    # Log the block
+                    self._log_event("INFO", f"Position conflict blocked: {strat_id} (NQ_LONG in position)")
+                    self.session_log['blocks'].append({
+                        'timestamp': datetime.now(),
+                        'blocked': strat_id,
+                        'reason': 'NQ_LONG already in position'
+                    })
+                    
+                    return False, "NQ_LONG already in position"
+        
+        return True, "OK"
+    
+    def _check_for_simultaneous_nq_positions(self):
+        """
+        RED FLAG CHECK: Verify NQ_LONG and NQ_SHORT are never both open
+        This should NEVER happen with smart blocking
+        """
+        nq_long_open = self.state.get('NQ_LONG', {}).get('in_position', False)
+        nq_short_open = self.state.get('NQ_SHORT', {}).get('in_position', False)
+        
+        if nq_long_open and nq_short_open:
+            # CRITICAL RED FLAG!
+            self._log_event("RED_FLAG", "NQ_LONG and NQ_SHORT both open simultaneously!", {
+                'nq_long_state': self.state['NQ_LONG'],
+                'nq_short_state': self.state['NQ_SHORT']
+            })
+            self.session_log['position_conflicts'].append({
+                'timestamp': datetime.now(),
+                'issue': 'Both NQ positions open'
+            })
+            return True  # Conflict detected
+        
+        return False  # No conflict
+
+    def get_signal(self, strat_id, df_entry, df_filter, df_exit):
+        """
+        SANDIP'S ORIGINAL STRATEGY - Properly Implemented with Smart Position Management
+        
+        CRITICAL FIX: Exits checked 24/7, time filter only applies to entries!
+        COMPREHENSIVE LOGGING: All red flags tracked
+        
+        Returns: (Signal, Price)
+        Signal options: 'BUY', 'SELL', 'EXIT_LONG', 'EXIT_SHORT', or None
+        """
+        
+        config = self.strategies.get(strat_id)
+        if not config: 
+            return None, None
+        
+        state = self.state[strat_id]
+        current_hour = datetime.now().hour
+        
+        # 1. Add Indicators to the DataFrames
+        self._add_ema(df_entry, config['ema_entry'])
+        self._add_ema(df_filter, config['ema_entry']) 
+        self._add_ema(df_exit, config['ema_exit'])
+
+        # 2. Get Key Rows
+        if len(df_entry) < 3 or len(df_filter) < 2 or len(df_exit) < 2:
+            return None, None
+
+        curr_entry = df_entry.iloc[-1]
+        prev_entry = df_entry.iloc[-2]
+        prev2_entry = df_entry.iloc[-3]
+        curr_filter = df_filter.iloc[-1]
+        prev_exit = df_exit.iloc[-2]
+
+        side = config['side']
+        entry_col = f"ema_{config['ema_entry']}"
+        exit_col = f"ema_{config['ema_exit']}"
+
+        # ==================== EXIT LOGIC (CHECKED FIRST - 24/7!) ====================
+        if state['in_position']:
+            if side == 'LONG':
+                if prev_exit['close'] < prev_exit[exit_col]:
+                    state['in_position'] = False
+                    state['cross_detected'] = False
+                    state['waiting_for_candle'] = False
+                    
+                    if current_hour in self.BAD_HOURS:
+                        print(f"🚪 EXIT: {strat_id} (during bad hour {current_hour}) - Close below {exit_col}")
+                        self._log_event("INFO", f"Exit during bad hour: {strat_id} at hour {current_hour} (CORRECT BEHAVIOR)")
+                        self.session_log['bad_hour_exits'].append({
+                            'timestamp': datetime.now(),
+                            'strategy': strat_id,
+                            'hour': current_hour
+                        })
+                    else:
+                        print(f"🚪 EXIT: {strat_id} - Close below {exit_col}")
+                        self._log_event("SIGNAL", f"Exit signal: {strat_id}")
+                    
+                    return 'EXIT_LONG', 0
+                    
+            else: # SHORT
+                if prev_exit['close'] > prev_exit[exit_col]:
+                    state['in_position'] = False
+                    state['cross_detected'] = False
+                    state['waiting_for_candle'] = False
+                    
+                    if current_hour in self.BAD_HOURS:
+                        print(f"🚪 EXIT: {strat_id} (during bad hour {current_hour}) - Close above {exit_col}")
+                        self._log_event("INFO", f"Exit during bad hour: {strat_id} at hour {current_hour} (CORRECT BEHAVIOR)")
+                        self.session_log['bad_hour_exits'].append({
+                            'timestamp': datetime.now(),
+                            'strategy': strat_id,
+                            'hour': current_hour
+                        })
+                    else:
+                        print(f"🚪 EXIT: {strat_id} - Close above {exit_col}")
+                        self._log_event("SIGNAL", f"Exit signal: {strat_id}")
+                    
+                    return 'EXIT_SHORT', 0
+            
+            return None, None
+
+        # ==================== ENTRY LOGIC ====================
+        if state['in_position']:
+            return None, None
+        
+        # Check if we can enter new positions (time filter + stops)
+        can_enter, reason = self.should_enter_new_position()
+        if not can_enter:
+            return None, None
+        
+        if side == 'LONG':
+            filter_ok = curr_filter['close'] > curr_filter[entry_col]
+            
+            if not filter_ok:
+                state['cross_detected'] = False
+                state['waiting_for_candle'] = False
+                return None, None
+            
+            cross_just_happened = (
+                prev2_entry['close'] <= prev2_entry[entry_col] and 
+                prev_entry['close'] > prev_entry[entry_col]
+            )
+            
+            if cross_just_happened and not state['cross_detected']:
+                state['cross_detected'] = True
+                state['waiting_for_candle'] = True
+                print(f"📈 CROSS UP: {strat_id} at {prev_entry['date']}")
+                self._log_event("SIGNAL", f"Cross detected: {strat_id} (waiting for signal candle)")
+            
+            if state['cross_detected'] and state['waiting_for_candle']:
+                if prev_entry['close'] < prev_entry['open']:
+                    
+                    can_open, block_reason = self._check_position_conflict(strat_id)
+                    
+                    if not can_open:
+                        print(f"🚫 BLOCKED: {strat_id} entry - {block_reason}")
+                        return None, None
+                    
+                    # RED FLAG CHECK: Verify not in bad hour
+                    if current_hour in self.BAD_HOURS:
+                        self._log_event("RED_FLAG", f"ENTRY DURING BAD HOUR: {strat_id} at hour {current_hour}!", {
+                            'strategy': strat_id,
+                            'hour': current_hour,
+                            'bad_hours': self.BAD_HOURS
+                        })
+                        self.session_log['bad_hour_trades'].append({
+                            'timestamp': datetime.now(),
+                            'strategy': strat_id,
+                            'hour': current_hour
+                        })
+                    
+                    entry_price = prev_entry['high'] + 0.1
+                    state['waiting_for_candle'] = False
+                    state['in_position'] = True
+                    
+                    print(f"🔥 BUY SIGNAL: {strat_id} at ${entry_price:.2f}")
+                    self._log_event("SIGNAL", f"Entry signal: {strat_id} at ${entry_price:.2f} (hour {current_hour})", {
+                        'strategy': strat_id,
+                        'price': entry_price,
+                        'hour': current_hour
+                    })
+                    
+                    # Check for position conflicts after entry
+                    self._check_for_simultaneous_nq_positions()
+                    
+                    return 'BUY', entry_price
+        
+        else:  # SHORT
+            filter_ok = curr_filter['close'] < curr_filter[entry_col]
+            
+            if not filter_ok:
+                state['cross_detected'] = False
+                state['waiting_for_candle'] = False
+                return None, None
+            
+            cross_just_happened = (
+                prev2_entry['close'] >= prev2_entry[entry_col] and 
+                prev_entry['close'] < prev_entry[entry_col]
+            )
+            
+            if cross_just_happened and not state['cross_detected']:
+                state['cross_detected'] = True
+                state['waiting_for_candle'] = True
+                print(f"📉 CROSS DOWN: {strat_id} at {prev_entry['date']}")
+                self._log_event("SIGNAL", f"Cross detected: {strat_id} (waiting for signal candle)")
+            
+            if state['cross_detected'] and state['waiting_for_candle']:
+                if prev_entry['close'] > prev_entry['open']:
+                    
+                    can_open, block_reason = self._check_position_conflict(strat_id)
+                    
+                    if not can_open:
+                        print(f"🚫 BLOCKED: {strat_id} entry - {block_reason}")
+                        return None, None
+                    
+                    # RED FLAG CHECK: Verify not in bad hour
+                    if current_hour in self.BAD_HOURS:
+                        self._log_event("RED_FLAG", f"ENTRY DURING BAD HOUR: {strat_id} at hour {current_hour}!", {
+                            'strategy': strat_id,
+                            'hour': current_hour,
+                            'bad_hours': self.BAD_HOURS
+                        })
+                        self.session_log['bad_hour_trades'].append({
+                            'timestamp': datetime.now(),
+                            'strategy': strat_id,
+                            'hour': current_hour
+                        })
+                    
+                    entry_price = prev_entry['low'] - 0.25
+                    state['waiting_for_candle'] = False
+                    state['in_position'] = True
+                    
+                    print(f"🔥 SELL SIGNAL: {strat_id} at ${entry_price:.2f}")
+                    self._log_event("SIGNAL", f"Entry signal: {strat_id} at ${entry_price:.2f} (hour {current_hour})", {
+                        'strategy': strat_id,
+                        'price': entry_price,
+                        'hour': current_hour
+                    })
+                    
+                    # Check for position conflicts after entry
+                    self._check_for_simultaneous_nq_positions()
+                    
+                    return 'SELL', entry_price
+                    
+        return None, None
+
+    def reset_state(self, strat_id):
+        """
+        Reset strategy state after exit or error
+        Call this when position is closed
+        """
+        if strat_id in self.state:
+            self.state[strat_id] = {
+                'cross_detected': False,
+                'waiting_for_candle': False,
+                'in_position': False
+            }
+            print(f"🔄 State reset for {strat_id}")
+            self._log_event("INFO", f"State reset: {strat_id}")
+
+    def get_stats(self):
+        """
+        Return current statistics
+        Useful for monitoring and debugging
+        """
+        summary = self._generate_daily_summary()
+        
+        stats = {
+            'daily_pnl': self.daily_pnl,
+            'weekly_pnl': self.weekly_pnl,
+            'conflicts_blocked': self.conflicts_blocked,
+            'positions': {
+                strat_id: state['in_position'] 
+                for strat_id, state in self.state.items()
+            },
+            'session_summary': summary,
+            'red_flags': len(self.session_log['errors']),
+            'bad_hour_trades': len(self.session_log['bad_hour_trades']),
+            'bad_hour_exits': len(self.session_log['bad_hour_exits'])
+        }
+        return stats
+    
+    def print_daily_report(self):
+        """
+        Print comprehensive daily report
+        Call this at end of day or when you want to review
+        """
+        summary = self._generate_daily_summary()
+        stats = self.get_stats()
+        
+        print("\n" + "="*80)
+        print("📊 DAILY REPORT")
+        print("="*80)
+        print(f"Date: {datetime.now().strftime('%Y-%m-%d')}")
+        print(f"Session Start: {self.session_log['session_start'].strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"\nP&L:")
+        print(f"  Daily:  ${self.daily_pnl:,.0f}")
+        print(f"  Weekly: ${self.weekly_pnl:,.0f}")
+        print(f"\nActivity:")
+        print(f"  Trades:  {summary['trades']}")
+        print(f"  Signals: {summary['signals']}")
+        print(f"  Blocks:  {summary['blocks']}")
+        print(f"\n🚨 RED FLAGS:")
+        print(f"  Total:                 {summary['red_flags']}")
+        print(f"  Bad Hour Entries:      {summary['bad_hour_trades']} ❌ (SHOULD BE 0!)")
+        print(f"  Position Conflicts:    {summary['conflicts']} ❌ (SHOULD BE 0!)")
+        print(f"\n✅ NORMAL EVENTS:")
+        print(f"  Bad Hour Exits:        {len(self.session_log['bad_hour_exits'])} ✅ (OK - exits work 24/7)")
+        print(f"  Conflicts Blocked:     {self.conflicts_blocked} ✅ (GOOD - smart blocking)")
+        print(f"\nCurrent Positions:")
+        for strat_id, in_pos in stats['positions'].items():
+            status = "OPEN ✅" if in_pos else "CLOSED"
+            print(f"  {strat_id}: {status}")
+        print("="*80 + "\n")
+
+    def _add_ema(self, df, span):
+        """Add EMA to dataframe if not already present"""
+        col_name = f"ema_{span}"
+        if col_name not in df.columns:
+            df[col_name] = df['close'].ewm(span=span, adjust=False).mean()
