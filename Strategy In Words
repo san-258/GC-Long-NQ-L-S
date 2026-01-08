@@ -1,0 +1,36 @@
+Here is the plain English breakdown of your 3-Strategy Portfolio:
+
+1. GC_LONG: "The Lazy Hunter"
+Goal: Catch massive multi-day trends in Gold while barely looking at the screen.
+The Vibe Check (Filter): Before doing anything, check the 1-Hour Chart. Is the price above the 10 EMA line? If yes, we are in a valid uptrend.
+The Entry (5-min chart):
+We wait for the price to be comfortably trending up (above the 10 EMA).
+We look for a Red Candle (a temporary dip/pullback).
+We place a "Buy Order" just above the High of that red candle.
+Logic: We don't buy the dip blindly. We wait for the price to break back UP above the dip, confirming the trend is resuming.
+The Exit (15-min chart):
+We hold the trade as long as the 15-minute candles stay above the 20 EMA line.
+We Sell to Close the moment a 15-minute candle closes below that 20 EMA line.
+Why? The 20 EMA on a 15m chart is a "loose leash." It lets Gold wiggle and shake without kicking you out, allowing you to ride huge moves.
+2. NQ_LONG: "The Momentum Surfer"
+Goal: Capture the aggressive rallies in Tech stocks (Nasdaq).
+The Vibe Check (Filter): 1-Hour Chart must be above the 10 EMA. Upside momentum only.
+The Entry (5-min chart):
+Same as Gold. Wait for a Red Candle (pullback) while trending up.
+Buy if price breaks the High of that red candle.
+The Exit (15-min chart):
+We hold as long as price stays above the 10 EMA.
+We Sell to Close when a 15-minute candle closes below the 10 EMA.
+Why? Nasdaq is faster and jerkier than Gold. We use a "tighter leash" (10 EMA vs 20 EMA) to lock in profits faster before it snaps back.
+3. NQ_SHORT: "The Widowmaker"
+Goal: Profit from panic. Stocks fall faster than they rise ("Stairs up, Elevator down").
+The Vibe Check (Filter): 1-Hour Chart must be BELOW the 10 EMA. We only short when the big picture looks ugly.
+The Entry (5-min chart):
+We wait for the price to be trending DOWN (below 10 EMA).
+We look for a Green Candle (a relief bounce).
+We place a "Sell Short Order" just below the Low of that green candle.
+Logic: We bet that the bounce will fail. If price breaks the low of the green candle, the selling panic is back on.
+The Exit (5-min chart - FAST):
+We hold only as long as the 5-minute candles stay below the 10 EMA.
+We Buy to Cover (Exit) the second a 5-minute candle closes above the 10 EMA.
+Why? Short squeezes kill accounts. We do NOT give this trade room to breathe. We get in, ride the flush, and get out the moment momentum slows down.
